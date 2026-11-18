@@ -245,6 +245,7 @@ class KellyKalshiApp:
         self.decimal_odds = 0
         self.latest_estimate = None
         self.build_ui()
+        self.load_settings()
 
     def run_worker(self, job, success, error=None):
         def worker():
@@ -481,6 +482,7 @@ class KellyKalshiApp:
         key = self.key_entry.get().strip()
         path = self.private_key_path_entry.get().strip()
         env = self.environment.get()
+        self.save_settings()
         self.api_connection_label.config(text='Connecting…')
         def job():
             api = KalshiAPI(key, path, env)
@@ -647,6 +649,37 @@ class KellyKalshiApp:
             self.set_ai_text('No probability generated. ' + error)
 
         self.run_worker(job, success, failure)
+
+    def save_settings(self):
+        settings = {
+            "kalshi_api_key": self.key_entry.get().strip(),
+            "pem_path": self.private_key_path_entry.get().strip()
+        }
+
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as file:
+            json.dump(settings, file, indent=4)
+
+
+    def load_settings(self):
+        if not SETTINGS_FILE.exists():
+            return
+
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
+                settings = json.load(file)
+
+            self.key_entry.delete(0, tk.END)
+            self.key_entry.insert(
+                0, settings.get("kalshi_api_key", "")
+            )
+
+            self.private_key_path_entry.delete(0, tk.END)
+            self.private_key_path_entry.insert(
+                0, settings.get("pem_path", "")
+            )
+
+        except (OSError, ValueError) as exc:
+            print(f"Could not load settings: {exc}")
 
 
 if __name__ == '__main__':

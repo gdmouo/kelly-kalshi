@@ -1,5 +1,5 @@
 ('D:\\Visual Studio Code '
- 'Projects\\PythonProjects\\deliverableyetagain\\build\\KellyKalshiAICrypto\\PYZ-00.pyz',
+ 'Projects\\PythonProjects\\superkalshi\\kellykalshi\\hi\\build\\KellyKalshiAICrypto\\PYZ-00.pyz',
  [('__future__',
    'C:\\Users\\juneg\\AppData\\Local\\Python\\pythoncore-3.15-64\\Lib\\__future__.py',
    'PYMODULE'),
