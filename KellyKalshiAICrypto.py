@@ -1,3 +1,5 @@
+from decimal import Decimal, InvalidOperation, ROUND_UP
+from uuid import uuid4
 import base64
 import datetime as dt
 import math
@@ -73,16 +75,46 @@ class KalshiAPI:
         return base64.b64encode(signature).decode()
 
     def get(self, path):
+        return self.request("GET", path)
+
+    def request(self, method, path, data=None):
         timestamp = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
         sign_path = urlparse(self.base_url + path).path
         headers = {
             'KALSHI-ACCESS-KEY': self.key_id,
-            'KALSHI-ACCESS-SIGNATURE': self.create_signature(timestamp, 'GET', sign_path),
+            'KALSHI-ACCESS-SIGNATURE': self.create_signature(timestamp, method, sign_path),
             'KALSHI-ACCESS-TIMESTAMP': timestamp
         }
-        response = requests.get(self.base_url + path, headers=headers, timeout=15)
-        response.raise_for_status()
+        response = requests.request(
+            method, self.base_url + path, headers=headers, json=data, timeout=15
+        )
+        if not response.ok:
+            raise RuntimeError(f"Kalshi returned HTTP {response.status_code}: {response.text}")
         return response.json()
+
+    def buy_order(self, ticker, side, count, price, order_id):
+        yes_price = price if side == "yes" else Decimal("1") - price
+        return self.request("POST", "/portfolio/events/orders", {
+            "ticker": ticker,
+            "side": "bid" if side == "yes" else "ask",
+            "count": f"{count:.2f}",
+            "price": f"{yes_price:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "client_order_id": order_id,
+        })
+
+    def transfer_between_indexes(self, source, destination, dollars, transfer_id):
+        return self.request("POST", "/portfolio/intra_exchange_instance_transfer", {
+            "amount": int(dollars * 10000),
+            "source": "event_contract",
+            "destination": "event_contract",
+            "source_exchange_shard": source,
+            "destination_exchange_shard": destination,
+            "source_subaccount": 0,
+            "destination_subaccount": 0,
+            "client_transfer_id": transfer_id,
+        })
 
     def markets(self, ticker):
         markets = []
@@ -396,6 +428,143 @@ class KellyKalshiApp:
         self.balance_label.pack(anchor='w')
         ttk.Button(account, text='Refresh', command=self.refresh).pack(anchor='w', pady=5)
 
+        row = ttk.Frame(account)
+        row.pack(fill="x", pady=5)
+        ttk.Label(row, text="Wager ($)").pack(side="left")
+        self.wager_entry = ttk.Entry(row, width=9)
+        self.wager_entry.pack(side="left", padx=5)
+        ttk.Label(row, text="Limit price (¢)").pack(side="left")
+        self.limit_entry = ttk.Entry(row, width=9)
+        self.limit_entry.pack(side="left", padx=5)
+        self.order_button = ttk.Button(row, text="Review buy order", command=self.review_order)
+        self.order_button.pack(side="left", padx=5)
+        self.exchange_label = ttk.Label(account, text="Market exchange balance: —")
+        self.exchange_label.pack(anchor="w")
+
+    def review_order(self):
+        api = self.api
+        market = self.markets_by_label.get(self.market_combo.get())
+        if not api or not market:
+            messagebox.showinfo("Order", "Connect and select a market first.")
+            return
+        
+        #if api.base_url != DEMO_URL:
+        #    messagebox.showinfo("Order", "Connect to Demo to use this order form.")
+        #    return
+
+        try:
+            wager = Decimal(self.wager_entry.get().strip())
+            cents = Decimal(self.limit_entry.get().strip())
+            fee = Decimal(self.fee_entry.get().strip()) / 100
+            if not all(value.is_finite() for value in (wager, cents, fee)):
+                raise ValueError
+            if not (wager > 0 and 0 < cents < 100 and fee >= 0):
+                raise ValueError
+            if cents != cents.quantize(Decimal("0.01")):
+                raise ValueError
+            price = cents / 100
+            count = int(wager // (price + fee))
+        except (ValueError, InvalidOperation):
+            messagebox.showerror("Invalid order", "Enter a positive wager, a limit between "
+                                 "0 and 100¢ with up to two decimals, and a nonnegative fee.")
+            return
+        if count < 1:
+            messagebox.showinfo("Order", "The wager is too small for one contract at this limit.")
+            return
+
+        ticker = market["ticker"]
+        side = self.side.get()
+        estimated_total = count * (price + fee)
+        self.order_button.state(["disabled"])
+        self.exchange_label.config(text=f"{ticker} · Checking exchange balance…")
+
+        def failed(error):
+            self.order_button.state(["!disabled"])
+            messagebox.showerror("Kalshi request failed", error)
+
+        def load_funding():
+            index = api.market(ticker)["exchange_index"]
+            data = api.get(f"/portfolio/balance?subaccount=0&exchange_index={index}")
+            breakdown = {row["exchange_index"]: Decimal(row["balance"])
+                         for row in data.get("balance_breakdown", [])}
+            balance = Decimal(data["balance_dollars"])
+            return index, balance, breakdown
+
+        def review(funding):
+            index, balance, breakdown = funding
+            if self.api is not api or self.markets_by_label.get(self.market_combo.get()) is not market:
+                self.order_button.state(["!disabled"])
+                return
+            self.exchange_label.config(text=f"{ticker} · Index {index} available: ${balance:.4f}")
+            if balance < estimated_total:
+                self.review_exchange_transfer(api, index, balance, breakdown, estimated_total, failed)
+                return
+
+            confirmed = messagebox.askyesno(
+                "Confirm limit buy",
+                f"{ticker}\nBuy {count} {side.upper()} at up to {cents}¢ each.\n"
+                f"Contract cost at limit: ${count * price:.4f} before fees.\n"
+                f"Estimated total with fees: ${estimated_total:.4f}.\n"
+                "Unfilled contracts can remain open until canceled.",
+            )
+            if not confirmed:
+                self.order_button.state(["!disabled"])
+                return
+            order_id = str(uuid4())
+
+            def accepted(order):
+                self.order_button.state(["!disabled"])
+                messagebox.showinfo("Order accepted",
+                                    f"Order ID: {order['order_id']}\n"
+                                    f"Filled: {order['fill_count']}\n"
+                                    f"Remaining: {order['remaining_count']}")
+                if self.api is api:
+                    self.refresh()
+
+            self.run_worker(lambda: api.buy_order(ticker, side, count, price, order_id),
+                            accepted, lambda error: failed(
+                                f"{error}\n\nClient order ID: {order_id}\n"
+                                "If the response was lost, check your orders before retrying."
+                            ))
+
+        self.run_worker(load_funding, review, failed)
+
+    def review_exchange_transfer(self, api, index, balance, breakdown, required, failed):
+        shortfall = (required - balance).quantize(Decimal("0.0001"), rounding=ROUND_UP)
+        candidates = [(amount, source) for source, amount in breakdown.items()
+                      if source != index and amount >= shortfall]
+        if not candidates:
+            self.order_button.state(["!disabled"])
+            messagebox.showinfo(
+                "Fund exchange index",
+                f"Index {index} has ${balance:.4f} and needs about ${shortfall:.4f} more.\n"
+                "Fund this index in Kalshi Demo, then review the order again.",
+            )
+            return
+        _, source = max(candidates)
+        if not messagebox.askyesno(
+            "Confirm demo transfer",
+            f"Move ${shortfall:.4f} from exchange index {source} to index {index}?\n"
+            "After the transfer, review the buy order again.",
+        ):
+            self.order_button.state(["!disabled"])
+            return
+
+        transfer_id = str(uuid4())
+
+        def transfer():
+            return api.transfer_between_indexes(source, index, shortfall, transfer_id)
+
+        def transferred(result):
+            self.order_button.state(["!disabled"])
+            self.exchange_label.config(text=f"Index {index} funded · Review the order again")
+            messagebox.showinfo("Demo transfer complete", f"Transfer ID: {result['transfer_id']}")
+
+        self.run_worker(transfer, transferred, lambda error: failed(
+            f"{error}\n\nClient transfer ID: {transfer_id}\n"
+            "If the response was lost, check the balances before retrying."
+        ))
+
     def build_kelly_calculator(self):
         frame = ttk.LabelFrame(self.outer, text='Kelly Criterion', padding=10)
         frame.pack(fill='x', pady=9)
@@ -534,12 +703,20 @@ class KellyKalshiApp:
         if labels:
             self.market_combo.current(0)
             self.on_market_selected()
+        else:
+            self.market_combo.set("")
+            self.selected_market = None
+            self.decimal_odds = 0
+            self.price_label.config(text="Contract price: —")
+            self.decimal_odds_label.config(text="Decimal odds: —")
+            self.exchange_label.config(text="Market exchange balance: —")
 
     def on_market_selected(self, _event=None):
         market = self.markets_by_label.get(self.market_combo.get())
         if not market:
             return
         self.selected_market = market
+        self.exchange_label.config(text="Market exchange balance: —")
         self.latest_estimate = None
         self.set_ai_text('No estimate for this market yet.')
         self.update_market_view()
@@ -555,6 +732,10 @@ class KellyKalshiApp:
             self.decimal_odds_label.config(text='Decimal odds: —')
         else:
             self.price_label.config(text=f'Contract price: {price:.2f}¢')
+
+            self.limit_entry.delete(0, tk.END)
+            self.limit_entry.insert(0,f'{price:.2f}')
+
             self.decimal_odds = 100 / price
             self.decimal_odds_label.config(text=f'Decimal odds: {self.decimal_odds:.2f}x')
 
@@ -594,6 +775,8 @@ class KellyKalshiApp:
             #self.refresh()
 
             wager = self.balance * full_kelly * multiplier
+            self.wager_entry.delete(0, tk.END)
+            self.wager_entry.insert(0,f'{wager:.2f}')
 
             self.wager_label.config(text=f'Illustrative Kelly allocation: ${wager:.2f}')
         except (ValueError, TypeError) as exc:
