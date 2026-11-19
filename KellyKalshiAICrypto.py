@@ -835,9 +835,15 @@ class KellyKalshiApp:
         self.run_worker(job, success, failure)
 
     def save_settings(self):
+        #settings = {
+        #    #"environment_entry": self.environment.get(),
+        #    "kalshi_api_key": self.key_entry.get().strip(),
+        #    "pem_path": self.private_key_path_entry.get().strip()
+        #}
         settings = {
             "kalshi_api_key": self.key_entry.get().strip(),
-            "pem_path": self.private_key_path_entry.get().strip()
+            "pem_path": self.private_key_path_entry.get().strip(),
+            "environment": self.environment.get(),
         }
 
         with open(SETTINGS_FILE, "w", encoding="utf-8") as file:
@@ -851,6 +857,10 @@ class KellyKalshiApp:
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
                 settings = json.load(file)
+
+            environment = settings.get("environment")
+            if environment in ("Demo", "Production"):
+                self.environment.set(environment)
 
             self.key_entry.delete(0, tk.END)
             self.key_entry.insert(
